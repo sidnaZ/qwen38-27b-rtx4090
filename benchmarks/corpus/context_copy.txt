@@ -1,0 +1,1928 @@
+
+===== FILE: prepare/build_draft_vocab.py =====
+"""Build a vocab-truncated draft head for MTP speculative decoding.
+
+The MTP drafter has to run the 248k-row lm_head once per draft token, and at
+4-6 drafts per step that head read (1.3 GB int8) dominates the draft cost.
+Speculative decoding stays exact no matter what the drafter proposes, so the
+drafter can use a head restricted to the N most frequent tokens: tokens
+outside the shortlist are simply never drafted (that position gets rejected
+and the target's own sample is used, as always).
+
+This script counts token frequencies over a text corpus (Danish + English +
+code + the model's own outputs), picks the top N ids (plus special tokens),
+slices those rows out of the already-int8-quantized lm_head, and stores them
+as `mtp.draft_lm_head.*` in model_extra_tensors.safetensors, plus the id map in
+`mtp_draft_vocab_ids.pt`. Needs the matching vLLM patch
+(patches/qwen3_5-mtp-draft-vocab.patch) to be used.
+
+Usage (from the repo root):
+  python prepare/build_draft_vocab.py /path/to/model --ids prepare/draft_vocab_ids.json  # shipped id list
+  python prepare/build_draft_vocab.py /path/to/model --n 40960 --corpus f1 f2 ...        # or count your own
+Corpus files: .txt/.jsonl (uses "prompt"/"response"/"messages"/"text" fields)/.parquet(text)/.py
+The shipped draft_vocab_ids.json was counted over Danish web text (fineweb-2),
+English Wikipedia, Python source and the model's own chat outputs (8.8M tokens);
+held-out coverage 95%.
+"""
+import glob, json, os, sys, shutil, collections
+import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
+
+d = sys.argv[1].rstrip("/") + "/"
+N = int(sys.argv[sys.argv.index("--n") + 1]) if "--n" in sys.argv else 40960
+corpus = sys.argv[sys.argv.index("--corpus") + 1:] if "--corpus" in sys.argv else []
+ids_file = sys.argv[sys.argv.index("--ids") + 1] if "--ids" in sys.argv else None
+
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained(d)
+
+def texts_from(path, limit_bytes=20_000_000):
+    n = 0
+    if path.endswith(".parquet"):
+        import pyarrow.parquet as pq
+        for t in pq.read_table(path, columns=["text"]).column("text").to_pylist():
+            yield t; n += len(t)
+            if n > limit_bytes: return
+    elif path.endswith(".jsonl"):
+        for line in open(path):
+            try: r = json.loads(line)
+            except Exception: continue
+            parts = []
+            for k in ("prompt", "response", "text"):
+                if isinstance(r.get(k), str): parts.append(r[k])
+            if isinstance(r.get("messages"), list):
+                parts += [m.get("content", "") for m in r["messages"] if isinstance(m.get("content"), str)]
+            t = "\n".join(parts); yield t; n += len(t)
+            if n > limit_bytes: return
+    else:
+        t = open(path, errors="ignore").read(); yield t
+
+counts = collections.Counter()
+held = collections.Counter()
+total = 0
+if ids_file:
+    ids = sorted(set(json.load(open(ids_file))))
+    print(f"using {len(ids)} ids from {ids_file}")
+    corpus = []
+for i, path in enumerate(corpus):
+    for j, t in enumerate(texts_from(path)):
+        ids = tok(t, add_special_tokens=False).input_ids
+        (held if j % 10 == 0 else counts).update(ids)
+        total += len(ids)
+print(f"corpus tokens: {total}")
+
+special = set(tok.all_special_ids)
+if ids_file:
+    special = set()
+for name in ("<|im_start|>", "<|im_end|>", "<|endoftext|>", "<think>", "</think>", "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>"):
+    tid = tok.convert_tokens_to_ids(name)
+    if isinstance(tid, int) and tid >= 0: special.add(tid)
+if not ids_file:
+    top = [t for t, _ in counts.most_common() if t not in special][: N - len(special)]
+    ids = sorted(set(top) | special)
+    cover = sum(c for t, c in held.items() if t in set(ids)) / max(1, sum(held.values()))
+    print(f"draft vocab: {len(ids)} ids, held-out token coverage {cover*100:.2f}%")
+    for n_try in (16384, 32768, 49152, 65536):
+        s = set(t for t, _ in counts.most_common(n_try)) | special
+        c = sum(c for t, c in held.items() if t in s) / max(1, sum(held.values()))
+        print(f"  coverage at N={n_try}: {c*100:.2f}%")
+    json.dump(ids, open(d + "draft_vocab_ids.json", "w"))
+    print(f"id list written to {d}draft_vocab_ids.json (copy it next to this script to reuse)")
+
+# slice lm_head rows
+idx = json.load(open(d + "model.safetensors.index.json"))
+wm = idx["weight_map"]
+head_shard = wm["lm_head.weight_packed"]
+with safe_open(d + head_shard, framework="pt") as f:
+    wp = f.get_tensor("lm_head.weight_packed")   # [vocab, K/8] int32
+    ws = f.get_tensor("lm_head.weight_scale")    # [vocab, K/group]
+    shape = f.get_tensor("lm_head.weight_shape")
+ids_t = torch.tensor(ids, dtype=torch.int64)
+sub_p = wp.index_select(0, ids_t).contiguous()
+sub_s = ws.index_select(0, ids_t).contiguous()
+sub_shape = torch.tensor([len(ids), int(shape[1])], dtype=torch.int64)
+print(f"draft head: packed {tuple(sub_p.shape)} {sub_p.dtype}, scales {tuple(sub_s.shape)} {sub_s.dtype}, "
+      f"{(sub_p.numel()*4 + sub_s.numel()*2)/1e6:.0f} MB")
+
+extra = "model_extra_tensors.safetensors"
+# The three quant_*.py scripts leave the base model's extras in this file; a
+# single-shard export processed by prepare/quant_heads_stream.py has no extras
+# file at all (#37) -- the draft head becomes its first content.
+tensors = {}
+meta = None
+if os.path.exists(d + extra):
+    with safe_open(d + extra, framework="pt") as f:
+        meta = f.metadata()
+        for k in f.keys():
+            tensors[k] = f.get_tensor(k)
+    if not os.path.exists(d + extra + ".bak-draft"):
+        shutil.copy(d + extra, d + extra + ".bak-draft")
+tensors["mtp.draft_lm_head.weight_packed"] = sub_p
+tensors["mtp.draft_lm_head.weight_scale"] = sub_s
+tensors["mtp.draft_lm_head.weight_shape"] = sub_shape
+save_file(tensors, d + extra, metadata=meta or {"format": "pt"})
+for s in ("weight_packed", "weight_scale", "weight_shape"):
+    wm[f"mtp.draft_lm_head.{s}"] = extra
+json.dump(idx, open(d + "model.safetensors.index.json", "w"), indent=2)
+torch.save(ids_t, d + "mtp_draft_vocab_ids.pt")
+print("done")
+
+
+===== FILE: patches/dflash2-lookup-drafting.patch =====
+Lookup-augmented block drafting (LABD) for DFlash2: draft from the context, not from the
+drafter, when the context already contains the answer -- and let the verify block be longer
+than the drafter's when it does.
+
+A block drafter guesses the next 7 tokens from a 2,048-token attention window. When the model
+is quoting, listing, editing or otherwise reproducing something it was given -- which is most
+of what a long-context assistant does -- those tokens are already sitting verbatim in the
+prompt, tens of thousands of tokens back, where the drafter cannot see them. This finds them:
+one Triton program per request scans the request's own token history (the int32 buffer vLLM
+already maintains, `req_states.all_token_ids`) for the most recent occurrence of the longest
+suffix (nmin..nmax tokens) of what has been generated, and proposes the tokens that followed
+it. An nmin-token reject test runs before any candidate is extended, so the scan costs a
+fraction of a millisecond whatever the batch size.
+
+Four things decide what that is worth.
+
+1. The verify block is decoupled from the drafter's block. `dflash_config.block_size` is a
+   property of the checkpoint (8 = 1 anchor + 7 mask tokens), and vLLM made it the target's
+   verify length as well, so a verbatim copy could never exceed 8 tokens per step -- and it
+   sat on that ceiling (7.83 of 8 accepted while reproducing a document's first 60 lines).
+   `DFlashSpeculator.draft_block` now describes the draft model's own query layout while
+   `num_speculative_tokens` describes the proposal handed to the target; the positions in
+   between are filled by the lookup. They cost the drafter nothing: no extra mask tokens, no
+   extra pass of the candidate head.
+
+2. The long block is only scheduled while the lookup is firing. Extra verify positions cost
+   about 1 ms of attention each at 25k context, so `DFlash2Speculator.next_num_draft_tokens`
+   tells the model runner how many of the proposals the scheduler should put up for
+   verification next step: the drafter's 7 normally, the whole block when the lookup has a
+   match (VLLM_DFLASH2_LOOKUP_ADAPTIVE=0 always asks for the whole block). Reading the
+   per-request match flags costs one small device-to-host read per step -- an async copy
+   into pinned memory would avoid the synchronise, but measured as not delivering the flags
+   in time on this path, and a long block that is never scheduled is worth much less than a
+   few percent of a step.
+   NOTE: vLLM only feeds draft token ids back to the scheduler on the synchronous scheduling
+   path, so this needs --no-async-scheduling (single-user/start_qwen.sh sets it; measured
+   cost at batch 1 is under 1%).
+
+3. The proposal is fused with the drafter's rather than substituted for it: a match of at
+   least VLLM_DFLASH2_LOOKUP_NSTRONG tokens is taken on its own, a shorter one only if the
+   drafter independently proposed the same first VLLM_DFLASH2_LOOKUP_AGREE tokens. Two
+   independent sources agreeing is a cheap confidence signal -- the drafter looked at the
+   hidden state, the lookup looked at the text.
+
+4. A match may overlap the suffix it matched, so a repeating pattern (a list marker, an
+   indent, a fence) is proposed from its own period instead of missed.
+
+The proposal stays lossless. For greedy requests the draft distribution is never read. For
+sampling requests every position the lookup filled gets a point mass on the proposed token,
+which is a legal proposal distribution for vLLM's rejection sampler: the acceptance
+probability becomes p(x) and the residual (p - q)+ is computed from the same buffer, so the
+output distribution is unchanged. The rewrite keeps the sparse draft-logit cache's invariant
+(every finite entry of a row is listed in `_cached_candidate_ids`, so the next step erases
+it) and reads the token back from `draft_tokens`, so q always describes what is verified.
+
+Requires patches/dflash2-backport.patch, and patches/spec-decode-attn.patch for a verify
+block longer than 10 query tokens (FlashAttention-2 does not split the KV sequence for
+multi-query decode; falling back to it doubles the step at 25k context).
+Apply from the installed vllm package directory:
+  patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/dflash2-lookup-drafting.patch
+
+Written against vLLM 0.27.1.
+--- a/model_executor/models/qwen3_dflash2.py
++++ b/model_executor/models/qwen3_dflash2.py
+@@ -182,8 +182,15 @@
+             hidden_size=config.hidden_size,
+             taps=int(draft_config["conv_kernel_size"]),
+             group_size=int(draft_config["conv_group_size"]),
+-            # Query tokens per request: the bonus token plus the mask tokens.
+-            block_size=1 + speculative_config.num_speculative_tokens,
++            # Query tokens per request: the bonus token plus the mask tokens. The drafter
++            # emits the block its checkpoint was trained for even when the target verifies a
++            # longer one (v1/worker/gpu/spec_decode/dflash2/lookup.py fills the rest from
++            # the context), and this convolution resets on the block boundary -- with the
++            # wrong size it runs across the boundary between two requests' blocks.
++            block_size=min(
++                1 + speculative_config.num_speculative_tokens,
++                int(draft_config.get("block_size", 1 << 30)),
++            ),
+             params_dtype=vllm_config.model_config.dtype,
+         )
+         self.attention_conv = DFlashGroupedConv(
+--- a/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from collections.abc import Mapping
+ from typing import Any
+ 
+@@ -42,8 +43,36 @@
+         # Multimodal inputs not currently supported.
+         self.supports_mm_inputs = False
+ 
++        # The drafter emits the block it was trained for (dflash_config.block_size - 1);
++        # the *verify* block may be longer than that, with the extra positions filled from
++        # the request's own context (dflash2/lookup.py). Everything describing the draft
++        # model's own query layout uses draft_block, everything describing the proposal
++        # handed to the target uses num_speculative_steps.
++        trained_block = (
++            int(
++                (getattr(self.draft_model_config.hf_config, "dflash_config", None) or {}).get(
++                    "block_size", 0
++                )
++            )
++            - 1
++        )
++        self.draft_block = self.num_speculative_steps
++        # Only the lookup can fill the extra positions, so without it the drafter keeps
++        # being asked for the whole (longer) block, which is also the honest A/B control.
++        lookup_on = os.environ.get("VLLM_DFLASH2_LOOKUP", "0") == "1"
++        if lookup_on and 0 < trained_block < self.num_speculative_steps:
++            self.draft_block = trained_block
++            logger.info(
++                "%s: drafting %d tokens per step (the block the checkpoint was trained "
++                "for); the remaining %d of %d verify positions are filled from context.",
++                self._speculator_name,
++                self.draft_block,
++                self.num_speculative_steps - self.draft_block,
++                self.num_speculative_steps,
++            )
++
+         # Each request emits exactly (bonus + N mask) query tokens per step.
+-        self.num_query_per_req = 1 + self.num_speculative_steps
++        self.num_query_per_req = 1 + self.draft_block
+ 
+         self.parallel_drafting_token_id = get_parallel_drafting_token_id(
+             self.draft_model_config.hf_config
+@@ -77,7 +106,7 @@
+         )
+ 
+         # Per-mask-token sampling buffers. Flattened from (num_reqs, num_spec_tokens).
+-        max_num_sampled_tokens = self.max_num_reqs * self.num_speculative_steps
++        max_num_sampled_tokens = self.max_num_reqs * self.draft_block
+         self.sample_indices = torch.zeros(
+             max_num_sampled_tokens, dtype=torch.int64, device=device
+         )
+@@ -91,7 +120,7 @@
+         # [0, 1, ..., N-1, 0, 1, ..., N-1, ...] -> the per-token column index into
+         # draft_logits[req, step, :].
+         self.sample_col = torch.arange(
+-            self.num_speculative_steps, dtype=torch.int32, device=device
++            self.draft_block, dtype=torch.int32, device=device
+         ).repeat(self.max_num_reqs)
+ 
+         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
+@@ -258,7 +287,7 @@
+             cudagraph_runtime_mode,
+         )
+ 
+-        num_sample = num_reqs * self.num_speculative_steps
++        num_sample = num_reqs * self.draft_block
+         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
+         # sample_pos is the predicted token's position Q; verification keys
+         # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
+@@ -271,8 +300,8 @@
+             self.sample_col[:num_sample],
+             self.draft_logits,
+         )
+-        self.draft_tokens[:num_reqs] = draft_tokens.view(
+-            num_reqs, self.num_speculative_steps
++        self.draft_tokens[:num_reqs, : self.draft_block] = draft_tokens.view(
++            num_reqs, self.draft_block
+         )
+ 
+     def _build_draft_attn_metadata(
+@@ -329,6 +358,11 @@
+         is_profile: bool = False,
+     ) -> torch.Tensor:
+         num_reqs = input_batch.num_reqs
++        # What the step that just ran actually produced per request: num_sampled counts the
++        # sampling slots it was given (bonus + drafts), num_rejected how many of those were
++        # thrown away, so the difference is the tokens it emitted. dflash2/lookup.py decides
++        # the next block length from it.
++        self.last_num_emitted = (num_sampled - num_rejected) if num_sampled is not None else None
+         num_target_tokens = input_batch.num_tokens
+         num_query_tokens = num_reqs * self.num_query_per_req
+         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+@@ -395,7 +429,7 @@
+                 self.block_tables.kernel_block_sizes[gid],
+                 self.parallel_drafting_token_id,
+                 self.num_query_per_req,
+-                self.num_speculative_steps,
++                self.draft_block,
+                 self.max_num_reqs,
+                 self.max_num_tokens,
+                 self.max_model_len,
+--- a/v1/worker/gpu/spec_decode/dflash2/speculator.py
++++ b/v1/worker/gpu/spec_decode/dflash2/speculator.py
+@@ -7,11 +7,19 @@
+ import torch
+ 
+ from vllm.config import VllmConfig
++from vllm.logger import init_logger
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.triton_utils import tl, tldevice, triton
+ from vllm.v1.worker.gpu.sample.gumbel import tl_rand32, tl_rand64
+ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+ 
++logger = init_logger(__name__)
++from vllm.v1.worker.gpu.spec_decode.dflash2.lookup import (
++    _point_mass_draft_logits_kernel,
++    fuse_draft,
++    suffix_lookup,
++)
++
+ 
+ @triton.jit
+ def _selector_walk_kernel(
+@@ -113,6 +121,7 @@
+     draft_logits_stride_0,
+     draft_logits_stride_1,
+     num_steps: tl.constexpr,
++    cache_steps: tl.constexpr,
+     top_k: tl.constexpr,
+     BLOCK_K: tl.constexpr,
+ ):
+@@ -122,7 +131,9 @@
+     offsets = tl.arange(0, BLOCK_K)
+     mask = (req_state >= 0) & (offsets < top_k)
+     candidate_base = flat * top_k
+-    cache_base = (req_state * num_steps + step) * top_k
++    # The candidate cache spans the whole verify block, of which the drafter fills the
++    # first num_steps rows (dflash2/lookup.py fills the rest).
++    cache_base = (req_state * cache_steps + step) * top_k
+     old_token_ids = tl.load(cached_candidate_ptr + cache_base + offsets, mask=mask)
+     logits_base = (
+         draft_logits_ptr
+@@ -137,6 +148,9 @@
+ 
+ 
+ class DFlash2Speculator(DFlashSpeculator):
++    """DFlash2 = DFlash + local convolutions + candidate selector, optionally with
++    lookup-augmented drafting (VLLM_DFLASH2_LOOKUP=1)."""
++
+     _speculator_name = "DFlash2"
+ 
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+@@ -147,10 +161,14 @@
+             torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
+             * self.num_query_per_req
+         )
+-        self._selector_tokens = torch.empty_like(self.draft_tokens)
++        self._selector_tokens = torch.empty(
++            (self.max_num_reqs, self.draft_block),
++            dtype=self.draft_tokens.dtype,
++            device=device,
++        )
+         self._selector_scores = torch.empty(
+             self.max_num_reqs,
+-            self.num_speculative_steps,
++            self.draft_block,
+             self.selector_top_k,
+             dtype=torch.float32,
+             device=device,
+@@ -167,14 +185,160 @@
+             dtype=torch.float32,
+             device=device,
+         )
++        # Spans the verify block: the point-mass rewrite keeps the same erase invariant
++        # for the positions the lookup fills beyond the drafter's own block.
+         self._cached_candidate_ids = torch.zeros(
+-            self._selector_scores.shape, dtype=torch.int64, device=device
++            (self.max_num_reqs, self.num_speculative_steps, self.selector_top_k),
++            dtype=torch.int64,
++            device=device,
+         )
+         # Request top_p/top_k buffers ([max_num_reqs], indexed by request state), handed
+         # over by the model runner; VLLM_DFLASH2_DRAFT_TOPK_TOPP=0 disables the truncation.
+         self._req_top_p: torch.Tensor | None = None
+         self._req_top_k: torch.Tensor | None = None
+         self._truncate = os.environ.get("VLLM_DFLASH2_DRAFT_TOPK_TOPP", "1") == "1"
++        # Lookup-augmented block drafting: propose the continuation of an earlier
++        # occurrence of the current suffix instead of the model's guess (lookup.py).
++        self._lookup = os.environ.get("VLLM_DFLASH2_LOOKUP", "0") == "1"
++        # Three separate questions, three thresholds (dflash2/lookup.py):
++        #  NMIN/NSTRONG/AGREE   when to let the lookup replace a token the drafter proposed
++        #  NMIN_TAIL            when to fill the positions the drafter never proposed
++        #  LONGMIN              when the long verify block is worth its step time
++        self._lookup_nmin = int(os.environ.get("VLLM_DFLASH2_LOOKUP_NMIN", "6"))
++        # 12, not 32: the kernel picks the longest match and breaks ties by recency, and a
++        # longer cap makes it prefer an older long match over a newer short one. On
++        # quote-and-explain work the newer one is the better predictor (3.21 vs 2.69 tokens
++        # per step), and copies match well past 12 either way.
++        self._lookup_nmax = int(os.environ.get("VLLM_DFLASH2_LOOKUP_NMAX", "12"))
++        # NSTRONG = NMIN and AGREE = 0 means "take any match of NMIN or more" for the
++        # positions the drafter also proposed. Measured better at C1 (3.33 vs 3.27 tokens
++        # per step) than requiring drafter agreement for medium matches.
++        self._lookup_nstrong = int(os.environ.get("VLLM_DFLASH2_LOOKUP_NSTRONG", "6"))
++        self._lookup_agree = int(os.environ.get("VLLM_DFLASH2_LOOKUP_AGREE", "0"))
++        self._lookup_nmin_tail = int(os.environ.get("VLLM_DFLASH2_LOOKUP_NMIN_TAIL", "4"))
++        self._lookup_long_min = int(os.environ.get("VLLM_DFLASH2_LOOKUP_LONGMIN", "6"))
++        # Below this many tokens of context the long block is taken unconditionally, on the
++        # theory that an extra verify position is nearly free there. Off by default: it
++        # measured +8% at C1 under one memory configuration and -13% under the one that
++        # ships (4 request slots, 56k), because what the extra positions cost depends on the
++        # paged-attention layout as much as on the KV length.
++        self._lookup_cheap_ctx = int(os.environ.get("VLLM_DFLASH2_LOOKUP_CHEAP_CTX", "0"))
++        self._lookup_search = int(os.environ.get("VLLM_DFLASH2_LOOKUP_SEARCH", str(1 << 30)))
++        self._req_states = None
++        self._lookup_tokens = torch.zeros(
++            (self.max_num_reqs, self.num_speculative_steps), dtype=torch.int32, device=device
++        )
++        self._lookup_len = torch.zeros(self.max_num_reqs, dtype=torch.int32, device=device)
++        self._lookup_valid = torch.zeros(self.max_num_reqs, dtype=torch.int32, device=device)
++        # Which draft positions came from the lookup, per request: what the point-mass
++        # rewrite of the draft distribution applies to.
++        self._lookup_use = torch.zeros(
++            (self.max_num_reqs, self.num_speculative_steps), dtype=torch.int32, device=device
++        )
++        self._lookup_hits = torch.zeros((), dtype=torch.int64, device=device)
++        # Adaptive verify length: a long block only pays for itself while the request is
++        # reproducing its context, so the scheduler is asked for the drafter's own block
++        # otherwise. The signal is the previous step's lookup decision, read from a pinned
++        # copy -- one step stale by construction, which costs at most one step at each end
++        # of a copy run and never needs a synchronise.
++        self._adaptive = (
++            os.environ.get("VLLM_DFLASH2_LOOKUP_ADAPTIVE", "1") == "1"
++            and self.draft_block < self.num_speculative_steps
++        )
++        self._take_flags = torch.zeros(
++            self.max_num_reqs, dtype=torch.int32, device=device
++        )
++        self._last_num_reqs = 0
++        self._flags_cpu = torch.zeros(
++            self.max_num_reqs, dtype=torch.int32, device="cpu"
++        ).pin_memory()
++        self._flags_n = 0
++        self._prev_want = False
++        # Entering the long block takes two qualifying steps in a row and leaving it took
++        # one, so a single step where the flag dropped out mid-copy cost three. It drops out
++        # for reasons that have nothing to do with the copy ending -- a line the lookup
++        # cannot match, or a flag copy that had not landed yet -- and the same server then
++        # measured 13.76, 13.92, 13.92, 13.92 and 13.92 tokens per step on consecutive runs
++        # of one prompt against 14.97 on the first. STICKY holds the long block for that
++        # many steps after the flag goes out, which makes it 15.21 every time.
++        #
++        # Gating the hold on "the request is still emitting a full block a step" -- which
++        # should distinguish a late flag from a finished copy -- removes the whole effect
++        # (13.92 again): by the time the flag drops the step it describes was not saturated
++        # either, so the two are not independent evidence.
++        #
++        # It only applies with one request in flight, and that restriction is not caution.
++        # This counter is one number for the whole batch, and unlike the entry condition it
++        # keeps the long block on through steps where the flags say no -- so with several
++        # requests, which block length a copying request gets starts to depend on when the
++        # others arrived. Different block length, different rounding, different greedy text:
++        # bench/labd_soak.py caught a verbatim copy coming out differently in two rounds of
++        # an otherwise identical 4-way batch, and reproducibly did not with STICKY=0.
++        self._lookup_sticky = int(os.environ.get("VLLM_DFLASH2_LOOKUP_STICKY", "3"))
++        self._sticky = 0
++
++        if self._lookup:
++            logger.info(
++                "DFlash2 lookup-augmented drafting on (k=%d nmin=%d nmax=%d nstrong=%d "
++                "agree=%d nmin_tail=%d longmin=%d search=%d)",
++                self.num_speculative_steps, self._lookup_nmin, self._lookup_nmax,
++                self._lookup_nstrong, self._lookup_agree, self._lookup_nmin_tail,
++                self._lookup_long_min, self._lookup_search,
++            )
++
++    def next_num_draft_tokens(self) -> int | None:
++        """How many of the proposed tokens the scheduler should put up for verification next
++        step (None = all of them).
++
++        This runs on the host once per step, which is why the decision lives here and not in
++        `_apply_lookup`: the draft pass is replayed from a captured CUDA graph, so anything
++        Python does in there runs at capture time only. The two inputs are the per-request
++        flag the (replayed) fuse kernel writes -- "there is something to put in the tail" --
++        and what the step that just finished emitted. A long block costs step time on every
++        request in the batch whether or not its tail is accepted, so it takes both, and
++        unanimity across the batch. Below CHEAP_CTX tokens of context an extra verify
++        position is nearly free (+6% per step at 1.5k against +27% at 25k), so there the
++        flag alone is enough."""
++        if not self._adaptive:
++            return None
++        emitted = getattr(self, "last_num_emitted", None)
++        if emitted is None:
++            return self.draft_block
++        if self.draft_max_seq_len <= self._lookup_cheap_ctx:
++            # An extra verify position costs attention proportional to the KV length: +6%
++            # per step at 1.5k of context against +27% at 25k. Below the threshold it is
++            # cheap enough that taking the long block unconditionally wins (+8% at C1),
++            # even on the steps where the lookup has nothing to put in it.
++            return self.num_speculative_steps
++        num_reqs = emitted.shape[0]
++        # Read the decision that landed from the previous step and start the copy for the
++        # next one. Reading it synchronously (`.item()`) is a device synchronise on every
++        # decode step and measured 5% -- more than the long block itself is worth on most
++        # work. One step of staleness costs a short step at the start of a copy run and a
++        # long one at its end.
++        want = bool(self._flags_n and self._flags_cpu[: self._flags_n].all())
++        fused = (self._take_flags[:num_reqs] > 0) & (emitted >= 1 + self.draft_block)
++        self._flags_cpu[:num_reqs].copy_(fused, non_blocking=True)
++        self._flags_n = num_reqs
++        # Two qualifying steps in a row, not one: a single saturated step happens in the
++        # middle of ordinary prose (a quoted phrase, a repeated list marker) and the long
++        # block it buys is then wasted. Waiting for the second one costs the first step of
++        # a copy and removes the loss on quote-and-explain work.
++        if want and self._prev_want:
++            long_block = True
++            self._sticky = self._lookup_sticky if num_reqs == 1 else 0
++        elif self._sticky > 0 and num_reqs == 1:
++            # Coasting: re-entry costs two steps, so a run that has already earned the long
++            # block twice gets the benefit of the doubt for a few more.
++            long_block, self._sticky = True, self._sticky - 1
++        else:
++            long_block, self._sticky = False, 0
++        self._prev_want = want
++        return self.num_speculative_steps if long_block else self.draft_block
++
++    def set_req_states(self, req_states) -> None:
++        """The token history the lookup matches against (set by the model runner)."""
++        self._req_states = req_states
+ 
+     def set_sampling_states(self, sampling_states) -> None:
+         self._req_top_p = sampling_states.top_p.gpu
+@@ -199,7 +363,7 @@
+             self._selector_scores,
+             self._req_top_p if truncate else self.temperature,
+             self._req_top_k if truncate else self.sample_idx_mapping,
+-            num_steps=self.num_speculative_steps,
++            num_steps=self.draft_block,
+             top_k=self.selector_top_k,
+             BLOCK_K=block_k,
+             USE_FP64=self.use_fp64_gumbel,
+@@ -219,7 +383,8 @@
+             self.sample_idx_mapping,
+             draft_logits.stride(0),
+             draft_logits.stride(1),
+-            num_steps=self.num_speculative_steps,
++            num_steps=self.draft_block,
++            cache_steps=self.num_speculative_steps,
+             top_k=self.selector_top_k,
+             BLOCK_K=block_k,
+             num_warps=1,
+@@ -241,15 +406,15 @@
+             num_tokens_across_dp,
+             cudagraph_runtime_mode,
+         )
+-        num_sample = num_reqs * self.num_speculative_steps
++        num_sample = num_reqs * self.draft_block
+         hidden_states = last_hidden_states[self.sample_indices[:num_sample]].view(
+-            num_reqs, self.num_speculative_steps, -1
++            num_reqs, self.draft_block, -1
+         )
+         candidate_ids, unary_logits = self.model.compute_candidates(
+             hidden_states.flatten(0, 1)
+         )
+         candidate_ids = candidate_ids.view(
+-            num_reqs, self.num_speculative_steps, self.selector_top_k
++            num_reqs, self.draft_block, self.selector_top_k
+         )
+         unary_logits = unary_logits.view_as(candidate_ids)
+         anchor_token_ids = self.input_buffers.input_ids[self._anchor_indices[:num_reqs]]
+@@ -261,4 +426,67 @@
+         )
+         self._sample_path(candidate_ids, scores, num_reqs)
+         self._cache_draft_logits(candidate_ids, num_sample)
+-        self.draft_tokens[:num_reqs].copy_(self._selector_tokens[:num_reqs])
++        self.draft_tokens[:num_reqs, : self.draft_block].copy_(
++            self._selector_tokens[:num_reqs]
++        )
++        self._apply_lookup(num_reqs)
++
++    def _apply_lookup(self, num_reqs: int) -> None:
++        """Fuse the drafted block with the continuation of an earlier occurrence of the
++        current suffix, where one exists (see dflash2/lookup.py), and fill the verify
++        positions past the drafter's own block. The draft distribution for every position
++        the lookup supplied becomes a point mass on the proposed token, which keeps vLLM's
++        rejection sampling exact."""
++        if not self._lookup or self._req_states is None:
++            return
++        tokens, match_len, valid = suffix_lookup(
++            self._req_states.all_token_ids.gpu,
++            self._req_states.total_len.gpu,
++            self.sample_idx_mapping,
++            num_reqs,
++            self.num_speculative_steps,
++            idx_mapping_stride=self.draft_block,
++            nmax=self._lookup_nmax,
++            nmin=self._lookup_nmin,
++            search_max=self._lookup_search,
++            out_tokens=self._lookup_tokens[:num_reqs],
++            out_len=self._lookup_len[:num_reqs],
++            out_valid=self._lookup_valid[:num_reqs],
++        )
++        fuse_draft(
++            self.draft_tokens[:num_reqs],
++            tokens,
++            match_len,
++            valid,
++            self._lookup_use[:num_reqs],
++            self.sample_idx_mapping,
++            self._lookup_hits,
++            num_reqs,
++            self.num_speculative_steps,
++            draft_block=self.draft_block,
++            idx_mapping_stride=self.draft_block,
++            nmin=self._lookup_nmin,
++            nstrong=self._lookup_nstrong,
++            agree_min=self._lookup_agree,
++            nmin_tail=self._lookup_nmin_tail,
++            long_min=self._lookup_long_min,
++            take_flags=self._take_flags[:num_reqs],
++        )
++        draft_logits = self.draft_logits
++        assert draft_logits is not None
++        block_k = triton.next_power_of_2(self.selector_top_k)
++        _point_mass_draft_logits_kernel[(num_reqs * self.num_speculative_steps,)](
++            draft_logits,
++            self._cached_candidate_ids,
++            self.draft_tokens,
++            self.draft_tokens.stride(0),
++            self._lookup_use,
++            self.sample_idx_mapping,
++            self.draft_block,
++            draft_logits.stride(0),
++            draft_logits.stride(1),
++            num_steps=self.num_speculative_steps,
++            top_k=self.selector_top_k,
++            BLOCK_K=block_k,
++            num_warps=1,
++        )
+--- a/v1/worker/gpu/spec_decode/dflash2/lookup.py
++++ b/v1/worker/gpu/spec_decode/dflash2/lookup.py
+@@ -0,0 +1,330 @@
++"""Lookup-augmented block drafting (LABD).
++
++When the tokens the model just produced already occurred earlier in this request's own
++context, the continuation is sitting right there: propose *that* instead of what the model
++drafter guessed. One Triton program per request finds the most recent occurrence of the
++longest suffix (NMIN..NMAX tokens) of the token history and returns the tokens that
++followed it.
++
++Three things make this worth more than a drafter override:
++
++* the proposal is not capped by the drafter's block. The drafter emits the 7 tokens it was
++  trained for; a verbatim copy can be dozens of tokens long, and the lookup can fill every
++  verify slot the server was launched with (`DFLASH_TOKENS`).
++* a match may overlap the suffix it is matched against, so a repeating pattern ("- item"
++  every line, an indent, a fence) is proposed from its own period rather than missed.
++* the match length is a confidence signal, so the two proposals can be *fused* -- a long
++  match takes the whole block, a short one only takes it if the drafter agrees with its
++  first tokens. All-or-nothing overriding on a 6-token match loses acceptance on prose.
++
++The proposal stays lossless: the caller rewrites the draft distribution for the overridden
++positions to a point mass on the proposed token, which is a legal q for vLLM's rejection
++sampler (accept probability becomes p(x), and the residual (p - q)+ is computed from the
++same buffer), so the output distribution is unchanged. Greedy requests never read q at all.
++
++Cost is one pass over the request's history (an int32 UVA tensor vLLM already maintains),
++with an NMIN-token reject test before any candidate is extended.
++"""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++# Positions are packed into one int64 score as len * SCORE_STRIDE + end_index, so that
++# "longest match, then most recent" is a single max-reduction. max_model_len < SCORE_STRIDE.
++SCORE_STRIDE = tl.constexpr(1 << 32)
++
++
++@triton.jit
++def _suffix_lookup_kernel(
++    all_token_ids_ptr,
++    all_token_ids_stride,
++    total_len_ptr,
++    idx_mapping_ptr,
++    idx_mapping_stride,
++    out_tokens_ptr,
++    out_tokens_stride,
++    out_len_ptr,
++    out_valid_ptr,
++    search_max,
++    k: tl.constexpr,
++    NMAX: tl.constexpr,
++    NMIN: tl.constexpr,
++    BLOCK: tl.constexpr,
++    BLOCK_KT: tl.constexpr,
++):
++    req = tl.program_id(0)
++    req_state = tl.load(idx_mapping_ptr + req * idx_mapping_stride)
++    if req_state < 0:
++        return
++    tl.store(out_len_ptr + req, 0)
++    tl.store(out_valid_ptr + req, 0)
++    total_len = tl.load(total_len_ptr + req_state)
++    if total_len < NMIN + 2:
++        return
++    base = all_token_ids_ptr + req_state.to(tl.int64) * all_token_ids_stride
++    end_of_suffix = total_len - 1
++
++    # Candidate match ends run over [lo, hi): any position before the suffix's own end.
++    # A candidate may overlap the suffix (a period-p repetition matches at e = t - p),
++    # which is how repeated list markers and indentation get proposed.
++    hi = end_of_suffix
++    lo = tl.maximum(NMIN - 1, total_len - search_max)
++    best = tl.full([], -1, tl.int64)
++    for start in range(lo, hi, BLOCK):
++        e = start + tl.arange(0, BLOCK)
++        alive = (e < hi) & (e >= lo)
++        # Reject on the NMIN-token prefix first: most blocks die here and never pay for
++        # the extension loop.
++        for j in range(NMIN):
++            s_j = tl.load(base + end_of_suffix - j)
++            t_j = tl.load(base + e - j, mask=alive & ((e - j) >= 0), other=-1)
++            alive = alive & (t_j == s_j)
++        if tl.max(alive.to(tl.int32)) > 0:
++            match = tl.where(alive, NMIN, 0)
++            longer = alive
++            for j in range(NMIN, NMAX):
++                s_j = tl.load(
++                    base + end_of_suffix - j, mask=(end_of_suffix - j) >= 0, other=-2
++                )
++                t_j = tl.load(base + e - j, mask=longer & ((e - j) >= 0), other=-1)
++                longer = longer & (t_j == s_j)
++                match = tl.where(longer, match + 1, match)
++            score = tl.where(alive, match.to(tl.int64) * SCORE_STRIDE + e.to(tl.int64), -1)
++            best = tl.maximum(best, tl.max(score, axis=0))
++    if best < 0:
++        return
++    match_len = (best // SCORE_STRIDE).to(tl.int32)
++    end = (best % SCORE_STRIDE).to(tl.int32)
++    # Tokens that actually follow the match inside the history. A match close to the suffix
++    # yields fewer than k of them; the caller leaves the rest of the block to the drafter.
++    valid = tl.minimum(k, end_of_suffix - end)
++    idx = tl.arange(0, BLOCK_KT)
++    toks = tl.load(base + end + 1 + idx, mask=idx < valid, other=0)
++    tl.store(out_tokens_ptr + req * out_tokens_stride + idx, toks, mask=idx < k)
++    tl.store(out_len_ptr + req, match_len)
++    tl.store(out_valid_ptr + req, valid)
++
++
++@triton.jit
++def _fuse_draft_kernel(
++    draft_tokens_ptr,
++    draft_stride,
++    lookup_tokens_ptr,
++    lookup_stride,
++    match_len_ptr,
++    valid_ptr,
++    use_ptr,
++    idx_mapping_ptr,
++    idx_mapping_stride,
++    hits_ptr,
++    take_flags_ptr,
++    nmin,
++    nstrong,
++    agree_min,
++    nmin_tail,
++    long_min,
++    draft_block,
++    k: tl.constexpr,
++    BLOCK_KT: tl.constexpr,
++):
++    """Fuse the lookup proposal into the drafted block, and record which positions came
++    from the lookup (`use`), which is what the point-mass rewrite consumes.
++
++    The two halves of the block are not the same bet, so they do not share a threshold.
++
++    Head (`idx < draft_block`): the drafter already proposed these, so taking the lookup's
++    token *replaces* a considered guess and a coincidental match is a loss. A match of at
++    least `nstrong` tokens is taken on its own; a shorter one (down to `nmin`) only if the
++    drafter independently proposed the same first `agree_min` tokens -- two independent
++    sources agreeing, one having looked at the hidden state and the other at the text.
++
++    Tail (`idx >= draft_block`): nobody proposed these, so anything the match supplies is
++    free and the threshold drops to `nmin_tail`. The only requirement is consistency with
++    the head that precedes them -- either the lookup owns the head too, or the drafter
++    independently agreed with it all the way to `draft_block`. Tail positions always get a
++    point mass, since nothing else wrote a draft distribution for them.
++
++    `take_flags` says only that this request has something to put in the tail: a match at
++    least `long_min` long with enough tokens left to fill the block. Whether the long block
++    is worth its step time is decided by the caller's controller, from what long blocks have
++    actually returned (match length is a poor predictor: a 6-token match can carry fifteen
++    correct tokens and a 12-token one none)."""
++    req = tl.program_id(0)
++    # 1 = "no objection": padding rows must not veto a batch-wide decision that is taken
++    # only when every active request wants the long block.
++    tl.store(take_flags_ptr + req, 1)
++    if tl.load(idx_mapping_ptr + req * idx_mapping_stride) < 0:
++        return
++    tl.store(take_flags_ptr + req, 0)
++    idx = tl.arange(0, BLOCK_KT)
++    kmask = idx < k
++    match_len = tl.load(match_len_ptr + req)
++    valid = tl.load(valid_ptr + req)
++    drafted = tl.load(draft_tokens_ptr + req * draft_stride + idx, mask=kmask, other=0)
++    # draft_tokens is int64 (vllm/v1/worker/gpu/spec_decode/speculator.py); the history the
++    # lookup reads is int32, so the proposal is widened before it is written back.
++    looked = tl.load(lookup_tokens_ptr + req * lookup_stride + idx, mask=kmask, other=0)
++    looked = looked.to(tl.int64)
++    # Leading agreement between the two proposals, over the drafter's own block.
++    disagree = (drafted != looked) & (idx < valid) & (idx < draft_block) & kmask
++    # Positions the match did not supply are not agreement: without this a match with one
++    # or two tokens left scores a full-block agreement and walks through the gate.
++    agree = tl.minimum(tl.min(tl.where(disagree, idx, draft_block)), valid)
++    take_head = (match_len >= nstrong) | ((match_len >= nmin) & (agree >= agree_min))
++    tail = idx >= draft_block
++    take_tail = (match_len >= nmin_tail) & (take_head | (agree >= draft_block))
++    from_lookup = tl.where(tail, take_tail, take_head) & (idx < valid) & kmask
++    tl.store(draft_tokens_ptr + req * draft_stride + idx, looked, mask=from_lookup)
++    use = (from_lookup | tail) & kmask
++    tl.store(use_ptr + req * k + idx, use.to(tl.int32), mask=kmask)
++    # Asking for the long block costs step time on every request in the batch whether or
++    # not the tail is accepted, so it takes evidence that a copy is *running*: the step that
++    # just finished accepted every token it was given (prev_acc = 1 + accepted, and a short
++    # block can produce at most 1 + draft_block), and the lookup has a long enough match
++    # with enough tokens left to fill the tail. Match length alone is a poor predictor --
++    # measured, it needs a threshold of 22 before it stops losing on prose, by which point
++    # it has given up most of the win on copy work.
++    # "This request has something to put in the tail." Whether the long block is worth its
++    # step time is decided by the caller: this kernel runs inside the draft model's captured
++    # CUDA graph, where host-side state is frozen at capture time.
++    has_tail = (match_len >= long_min) & (valid > draft_block) & take_tail
++    tl.store(take_flags_ptr + req, has_tail.to(tl.int32))
++    tl.atomic_add(hits_ptr, take_head.to(tl.int64))
++
++
++@triton.jit
++def _point_mass_draft_logits_kernel(
++    draft_logits_ptr,
++    cached_candidate_ptr,
++    draft_tokens_ptr,
++    draft_tokens_stride,
++    use_ptr,
++    idx_mapping_ptr,
++    idx_mapping_stride,
++    draft_logits_stride_0,
++    draft_logits_stride_1,
++    num_steps: tl.constexpr,
++    top_k: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    """Rewrite one (request, step) row of the sparse draft-logit cache to a point mass on the
++    proposed token, keeping the cache's invariant that every finite entry of a row is listed
++    in `cached_candidate_ids` (so the next step erases it). The token is read back from
++    draft_tokens, so q always describes the proposal that is actually verified."""
++    flat = tl.program_id(0)
++    req = flat // num_steps
++    step = flat % num_steps
++    req_state = tl.load(idx_mapping_ptr + req * idx_mapping_stride)
++    if req_state < 0:
++        return
++    if tl.load(use_ptr + req * num_steps + step) == 0:
++        return
++    offsets = tl.arange(0, BLOCK_K)
++    mask = offsets < top_k
++    cache_base = (req_state * num_steps + step) * top_k
++    logits_base = (
++        draft_logits_ptr + req_state * draft_logits_stride_0 + step * draft_logits_stride_1
++    )
++    old = tl.load(cached_candidate_ptr + cache_base + offsets, mask=mask)
++    tl.store(logits_base + old, -float("inf"), mask=mask)
++    token = tl.load(draft_tokens_ptr + req * draft_tokens_stride + step)
++    tl.store(logits_base + token, 0.0)
++    tl.store(cached_candidate_ptr + cache_base + offsets, token, mask=mask)
++
++
++def suffix_lookup(
++    all_token_ids: torch.Tensor,
++    total_len: torch.Tensor,
++    idx_mapping: torch.Tensor,
++    num_reqs: int,
++    k: int,
++    idx_mapping_stride: int = 1,
++    nmax: int = 32,
++    nmin: int = 4,
++    search_max: int = 1 << 30,
++    out_tokens: torch.Tensor | None = None,
++    out_len: torch.Tensor | None = None,
++    out_valid: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Returns (tokens [num_reqs, k] int32, match_len [num_reqs] int32; 0 = no match,
++    valid [num_reqs] int32 = how many of the k tokens the match actually supplied).
++
++    idx_mapping maps batch position -> request-state index, read with idx_mapping_stride
++    (the DFlash speculators keep it as sample_idx_mapping, one entry per (request, step))."""
++    device = idx_mapping.device
++    if out_tokens is None:
++        out_tokens = torch.zeros((num_reqs, k), dtype=torch.int32, device=device)
++    if out_len is None:
++        out_len = torch.zeros(num_reqs, dtype=torch.int32, device=device)
++    if out_valid is None:
++        out_valid = torch.zeros(num_reqs, dtype=torch.int32, device=device)
++    _suffix_lookup_kernel[(num_reqs,)](
++        all_token_ids,
++        all_token_ids.stride(0),
++        total_len,
++        idx_mapping,
++        idx_mapping_stride,
++        out_tokens,
++        out_tokens.stride(0),
++        out_len,
++        out_valid,
++        search_max,
++        k=k,
++        NMAX=nmax,
++        NMIN=nmin,
++        BLOCK=1024,
++        BLOCK_KT=triton.next_power_of_2(k),
++        num_warps=4,
++    )
++    return out_tokens, out_len, out_valid
++
++
++def fuse_draft(
++    draft_tokens: torch.Tensor,
++    lookup_tokens: torch.Tensor,
++    match_len: torch.Tensor,
++    valid: torch.Tensor,
++    use: torch.Tensor,
++    idx_mapping: torch.Tensor,
++    hits: torch.Tensor,
++    num_reqs: int,
++    k: int,
++    draft_block: int | None = None,
++    idx_mapping_stride: int = 1,
++    nmin: int = 6,
++    nstrong: int = 8,
++    agree_min: int = 2,
++    nmin_tail: int = 4,
++    long_min: int = 6,
++    take_flags: torch.Tensor | None = None,
++) -> None:
++    """In-place: draft_tokens[:num_reqs] <- fused proposal, use <- overridden positions.
++
++    draft_block is how many of the k verify positions the drafter itself proposed; the
++    rest are the lookup's to fill (defaults to all k, i.e. the drafter filled the block)."""
++    assert draft_tokens.dtype == torch.int64
++    if take_flags is None:
++        take_flags = torch.zeros(num_reqs, dtype=torch.int32, device=draft_tokens.device)
++    _fuse_draft_kernel[(num_reqs,)](
++        draft_tokens,
++        draft_tokens.stride(0),
++        lookup_tokens,
++        lookup_tokens.stride(0),
++        match_len,
++        valid,
++        use,
++        idx_mapping,
++        idx_mapping_stride,
++        hits,
++        take_flags,
++        nmin,
++        nstrong,
++        agree_min,
++        nmin_tail,
++        long_min,
++        k if draft_block is None else draft_block,
++        k=k,
++        BLOCK_KT=triton.next_power_of_2(k),
++        num_warps=1,
++    )
+--- a/v1/worker/gpu/spec_decode/utils.py
++++ b/v1/worker/gpu/spec_decode/utils.py
+@@ -20,10 +20,16 @@
+         self.num_draft_tokens: int = 0
+ 
+     def set_draft_tokens(
+-        self, input_batch: InputBatch, draft_tokens: torch.Tensor
++        self, input_batch: InputBatch, draft_tokens: torch.Tensor, num_draft: int | None = None
+     ) -> None:
++        """num_draft: how many of the proposed tokens the scheduler should actually put up
++        for verification next step, when that is fewer than the speculator produced. The
++        DFlash2 lookup uses it to pay for a long verify block only while the request is
++        reproducing its context (dflash2/lookup.py)."""
+         self.req_ids = input_batch.req_ids
+-        self.num_draft_tokens = draft_tokens.shape[1]
++        self.num_draft_tokens = draft_tokens.shape[1] if num_draft is None else num_draft
++        if num_draft is not None:
++            draft_tokens = draft_tokens[:, :num_draft]
+         if not input_batch.has_structured_output_reqs:
+             # No draft token validation needs to be performed by
+             # the scheduler for this batch.
+--- a/v1/worker/gpu/model_runner.py
++++ b/v1/worker/gpu/model_runner.py
+@@ -244,6 +244,9 @@
+             device=self.device,
+             num_prefill_lookahead=num_prefill_lookahead,
+         )
++        if self.speculator is not None and hasattr(self.speculator, "set_req_states"):
++            # Lookup-augmented drafting reads the request token history.
++            self.speculator.set_req_states(self.req_states)
+         self.input_buffers = InputBuffers(
+             max_num_reqs=self.max_num_reqs,
+             max_num_tokens=self.max_num_tokens,
+@@ -1605,9 +1608,18 @@
+         if self.num_speculative_steps > 0:
+             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
+             # not have a speculator (i.e. self.speculator is None)
++            num_draft = None
++            if self.speculator is not None and hasattr(
++                self.speculator, "next_num_draft_tokens"
++            ):
++                # Lookup-augmented drafting proposes a long block only while the request
++                # is reproducing its context; the rest of the time it asks the scheduler
++                # to verify the drafter's own (much cheaper) block.
++                num_draft = self.speculator.next_num_draft_tokens()
+             self.draft_tokens_handler.set_draft_tokens(
+                 input_batch,
+                 self.req_states.draft_tokens[input_batch.idx_mapping],
++                num_draft=num_draft,
+             )
+ 
+         # Post-step KV connector related operations.
+--- a/v1/worker/gpu/cudagraph_utils.py
++++ b/v1/worker/gpu/cudagraph_utils.py
+@@ -219,7 +219,34 @@
+             ]
+         else:
+             decode_query_lens = [self.decode_query_len]
++            # A DFlash drafter whose checkpoint block is shorter than the verify block
++            # (v1/worker/gpu/spec_decode/dflash2/lookup.py fills the rest from the request's
++            # own context) schedules either length, so both need a decode graph. Without
++            # this the short step -- the one taken on ordinary prose -- runs piecewise.
++            import os as _os
++
++            if (
++                speculative_config is not None
++                and _os.environ.get("VLLM_DFLASH2_GRAPH_BOTH", "1") == "1"
++                and _os.environ.get("VLLM_DFLASH2_LOOKUP", "0") == "1"
++            ):
++                _cfg = getattr(
++                    getattr(speculative_config, "draft_model_config", None),
++                    "hf_config",
++                    None,
++                )
++                _block = int((getattr(_cfg, "dflash_config", None) or {}).get("block_size", 0))
++                _short = _block + (
++                    self.decode_query_len - self.vllm_config.num_speculative_tokens - 1
++                )
++                if 0 < _short < self.decode_query_len:
++                    decode_query_lens.append(_short)
++                    logger.info(
++                        "Capturing decode graphs for query lengths %s (the drafter's block "
++                        "and the full verify block).",
++                        decode_query_lens,
++                    )
+ 
+         for num_tokens, num_active_loras in product(
+             capture_sizes, self.lora_capture_cases
+         ):
+
+
+===== FILE: patches/spec-decode-attn.patch =====
+Split-KV attention for speculative-decode batches on the FLASH_ATTN backend
+(vLLM 0.27.1, Ampere), with query-row tiling so the verify block can be longer
+than the drafter's.
+
+FlashAttention-2 only splits the KV sequence across thread blocks when a request
+has exactly one query token; with MTP (k+1 = 5 queries) a 24-head model gets 24
+blocks on the 3090's 82 SMs and each attention layer takes ~57 us for a 1.5k
+context. The Triton kernel in v1/attention/ops/spec_decode_attn.py gives every
+(request, kv-head, query tile) NUM_SEGMENTS blocks with an online-softmax partial
+and a combine step. Enabled with VLLM_SPEC_DECODE_ATTN=1 (bf16 KV cache only, no
+sliding window / softcap / alibi).
+
+The query rows of one request (q_len x G of them, G = query heads per kv head)
+are now split into tiles of BLOCK_M rows instead of having to fit in one, so the
+kernel is not capped at BLOCK_M // G query tokens. That cap is what made a verify
+block longer than the drafter's unaffordable: a 16-token block fell back to FA2
+and doubled the step at 25k context. Measured per attention layer, batch 1,
+25k-token context: 250 / 583 / 1,132 us at 8 / 16 / 32 query tokens, against
+FA2's 2,085 / 2,053 / 1,997 us. BLOCK_M is chosen to keep the tile count at 1
+where the register budget allows (128 rows with 8 warps), since every extra tile
+re-reads that request's KV segment.
+
+The partial buffers are allocated once, for VLLM_SPEC_DECODE_ATTN_QMAX query
+tokens (single-user/start_qwen.sh sets it from DFLASH_TOKENS). They must not grow
+afterwards: a captured CUDA graph holds their addresses, and a later reallocation
+- which is what happened as soon as a small prefill chunk asked for a longer
+block - leaves the captured decode graph reading freed memory.
+
+Apply from the repo root:
+  patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/spec-decode-attn.patch
+
+--- a/v1/attention/backends/flash_attn.py
++++ b/v1/attention/backends/flash_attn.py
+@@ -1038,6 +1038,37 @@
+                     )
+                     causal = not has_window
+ 
++                # syv patch: split-KV Triton attention for speculative-decode
++                # batches (1 < queries/request <= 10). FA2 does not split the KV
++                # sequence when max_seqlen_q > 1, leaving most SMs idle.
++                if (
++                    _spec_attn_enabled()
++                    and 1 < max_seqlen_q <= _spec_attn_qmax(self.num_heads // self.num_kv_heads)
++                    and not is_quantized_kv_cache(self.kv_cache_dtype)
++                    and (
++                        sliding_window_size is None
++                        or (sliding_window_size[0] < 0 and sliding_window_size[1] < 0)
++                    )
++                    and not self.logits_soft_cap
++                    and self.alibi_slopes is None
++                    and self.sinks is None
++                    and causal is True
++                    and mm_mask_mod is None
++                    and rswa_mask_mod_fn is None
++                ):
++                    _spec_attn_run(
++                        self,
++                        query[:num_actual_tokens],
++                        key_cache,
++                        value_cache,
++                        output[:num_actual_tokens],
++                        cu_seqlens_q,
++                        seqused_k,
++                        block_table,
++                        max_seqlen_q,
++                    )
++                    return output
++
+                 flash_attn_varlen_func(
+                     q=query[:num_actual_tokens],
+                     k=key_cache,
+@@ -1688,3 +1719,61 @@
+ 
+     # Merge prefix and suffix outputs, and store the result in output.
+     merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)
++
++
++# ---- syv patch: split-KV spec-decode attention -------------------------------
++_SPEC_ATTN = {}
++
++
++def _spec_attn_enabled() -> bool:
++    import os
++
++    return os.environ.get("VLLM_SPEC_DECODE_ATTN", "0") == "1"
++
++
++_SPEC_ATTN_QMAX: int | None = None
++
++
++def _spec_attn_qmax(group: int) -> int:
++    # The kernel tiles the query rows itself, so the cap is on query tokens per request
++    # rather than on q_len * group (which used to stop a verify block longer than 10).
++    # It is fixed for the life of the server: the partial buffers are sized for it once,
++    # and a captured CUDA graph holds their addresses.
++    global _SPEC_ATTN_QMAX
++    if _SPEC_ATTN_QMAX is None:
++        import os
++
++        from vllm.config import get_current_vllm_config
++        from vllm.v1.attention.ops.spec_decode_attn import BLOCK_M, QMAX_TOKENS
++
++        n = 0
++        try:
++            spec = get_current_vllm_config().speculative_config
++            n = 1 + (spec.num_speculative_tokens if spec is not None else 0)
++        except Exception:
++            n = 0
++        n = int(os.environ.get("VLLM_SPEC_DECODE_ATTN_QMAX", n or 0)) or n
++        _SPEC_ATTN_QMAX = min(QMAX_TOKENS, max(n, BLOCK_M // group))
++    return _SPEC_ATTN_QMAX
++
++
++def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, max_seqlen_q):
++    from vllm.v1.attention.ops.spec_decode_attn import SpecDecodeAttention
++
++    key = (impl.num_heads, impl.head_size, q.device)
++    att = _SPEC_ATTN.get(key)
++    if att is None:
++        from vllm.config import get_current_vllm_config
++
++        try:
++            max_reqs = get_current_vllm_config().scheduler_config.max_num_seqs
++        except Exception:
++            max_reqs = 256
++        max_reqs = max(max_reqs, cu_seqlens_q.shape[0] - 1)
++        att = SpecDecodeAttention(
++            max_reqs, impl.num_heads, impl.head_size, q.device,
++            qmax=_spec_attn_qmax(impl.num_heads // impl.num_kv_heads),
++        )
++        _SPEC_ATTN[key] = att
++    att.run(q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, impl.scale,
++            cu_seqlens_q.shape[0] - 1, max_seqlen_q)
+--- a/v1/attention/ops/spec_decode_attn.py
++++ b/v1/attention/ops/spec_decode_attn.py
+@@ -0,0 +1,201 @@
++"""Split-KV paged attention for speculative-decode batches (a few query tokens per
++request, GQA), Triton.
++
++Neither vLLM's FlashAttention-2 path nor its Triton unified attention split the KV
++sequence across SMs when a request has more than one query token: with MTP k=4
++(5 queries) on a 24-head model that leaves 24 (FA) or ~8 (Triton) thread blocks on an
++82-SM RTX 3090 and the attention layer takes ~57 us for a 1.5k-token context.
++This kernel gives every (request, kv-head, query tile) NUM_SEGMENTS blocks, each
++computing an online-softmax partial over its slice of the KV cache for all its query
++rows at once (G = query heads per kv head), followed by a tiny combine kernel.
++
++Long blocks: the query rows of one request (q_len x G of them) are split into tiles of
++BLOCK_M rows, so the kernel is not capped at BLOCK_M // G query tokens. That cap is what
++made lookup-augmented drafting unaffordable past a block of 7 -- a 16-token verify fell
++back to FA2 and doubled the step at 25k context. Each tile re-reads the KV segment, so
++BLOCK_M is chosen to keep the tile count at 1 where the register budget allows.
++
++Layout matches vLLM's FLASH_ATTN backend: q [T, Hq, D], key/value cache
++[num_blocks, block_size, Hkv, D] (block_size any multiple of 16), block_table
++[num_reqs, max_blocks], seqused_k [num_reqs] = kv length including the new tokens,
++cu_seqlens_q [num_reqs + 1]. Query token i of a request sits at kv position
++seqused_k - q_len + i and attends causally.
++
++Restrictions: q_len <= QMAX_TOKENS per request, D a power of two <= 256, no sliding
++window / softcap / alibi.
++"""
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++NUM_SEGMENTS = 16
++BLOCK_M = 64       # query rows (q_len * G) per program at the default register budget
++BLOCK_M_BIG = 128  # ... and with 8 warps, which keeps a 16-token block in one tile
++QMAX_TOKENS = 64   # query tokens per request the caller may ask for
++
++
++@triton.jit
++def _spec_attn_partial(
++    q_ptr, k_ptr, v_ptr, bt_ptr, seqused_ptr, cu_q_ptr,
++    part_o_ptr, part_m_ptr, part_l_ptr,
++    scale,
++    stride_qt, stride_qh,
++    stride_kb, stride_ks, stride_kh,
++    stride_vb, stride_vs, stride_vh,
++    stride_bt,
++    G: tl.constexpr, Hq: tl.constexpr, QMAX: tl.constexpr, D: tl.constexpr, BLOCK_SIZE: tl.constexpr,
++    BLOCK_M: tl.constexpr, TILE: tl.constexpr, NSEG: tl.constexpr, QT: tl.constexpr,
++    NTILE: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    req = pid // NTILE
++    qtile = pid % NTILE
++    kvh = tl.program_id(1)
++    seg = tl.program_id(2)
++
++    q_start = tl.load(cu_q_ptr + req)
++    q_len = tl.load(cu_q_ptr + req + 1) - q_start
++    kv_len = tl.load(seqused_ptr + req)
++
++    # rows: r = i * G + g  -> query token qtile * QT + i (0..q_len-1), head kvh*G + g
++    r = tl.arange(0, BLOCK_M)
++    ri = qtile * QT + r // G
++    rg = r % G
++    row_ok = (r < QT * G) & (ri < q_len)
++    q_pos = kv_len - q_len + ri                      # kv position of each query row
++    d = tl.arange(0, D)
++    q_ptrs = q_ptr + (q_start + ri)[:, None] * stride_qt + (kvh * G + rg)[:, None] * stride_qh + d[None, :]
++    q = tl.load(q_ptrs, mask=row_ok[:, None], other=0.0)
++
++    # this segment's key range
++    tiles_total = (kv_len + TILE - 1) // TILE
++    tiles_per_seg = (tiles_total + NSEG - 1) // NSEG
++    t0 = seg * tiles_per_seg
++    t1 = tl.minimum(t0 + tiles_per_seg, tiles_total)
++
++    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
++    l_i = tl.zeros([BLOCK_M], tl.float32)
++    acc = tl.zeros([BLOCK_M, D], tl.float32)
++    qs = (q * scale).to(tl.bfloat16)
++
++    for t in range(t0, t1):
++        pos = t * TILE + tl.arange(0, TILE)
++        k_ok = pos < kv_len
++        blk = tl.load(bt_ptr + req * stride_bt + pos // BLOCK_SIZE, mask=k_ok, other=0)
++        slot = pos % BLOCK_SIZE
++        k_ptrs = k_ptr + blk[:, None] * stride_kb + slot[:, None] * stride_ks + kvh * stride_kh + d[None, :]
++        v_ptrs = v_ptr + blk[:, None] * stride_vb + slot[:, None] * stride_vs + kvh * stride_vh + d[None, :]
++        k = tl.load(k_ptrs, mask=k_ok[:, None], other=0.0)
++        v = tl.load(v_ptrs, mask=k_ok[:, None], other=0.0)
++        s = tl.dot(qs, tl.trans(k)).to(tl.float32)            # [BLOCK_M, TILE]
++        allowed = k_ok[None, :] & (pos[None, :] <= q_pos[:, None]) & row_ok[:, None]
++        s = tl.where(allowed, s, float("-inf"))
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
++        p = tl.exp(s - m_safe[:, None])
++        alpha = tl.exp(tl.where(m_i == float("-inf"), float("-inf"), m_i - m_safe))
++        l_i = l_i * alpha + tl.sum(p, 1)
++        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v).to(tl.float32)
++        m_i = m_new
++
++    # store partials at flat index ((req*Hq + head)*QMAX + i)*NSEG + seg
++    hrow = kvh * G + rg
++    pidx = ((req * Hq + hrow) * QMAX + ri) * NSEG + seg
++    tl.store(part_o_ptr + pidx[:, None] * D + d[None, :], acc, mask=row_ok[:, None])
++    tl.store(part_m_ptr + pidx, m_i, mask=row_ok)
++    tl.store(part_l_ptr + pidx, l_i, mask=row_ok)
++
++
++@triton.jit
++def _spec_attn_combine(
++    part_o_ptr, part_m_ptr, part_l_ptr, out_ptr, cu_q_ptr,
++    stride_ot, stride_oh,
++    Hq: tl.constexpr, QMAX: tl.constexpr, D: tl.constexpr, NSEG: tl.constexpr,
++):
++    req = tl.program_id(0)
++    h = tl.program_id(1)
++    i = tl.program_id(2)
++    q_start = tl.load(cu_q_ptr + req)
++    q_len = tl.load(cu_q_ptr + req + 1) - q_start
++    if i < q_len:
++        base = ((req * Hq + h) * QMAX + i) * NSEG
++        segs = tl.arange(0, NSEG)
++        m = tl.load(part_m_ptr + base + segs)
++        l = tl.load(part_l_ptr + base + segs)
++        m_max = tl.max(m, 0)
++        m_max = tl.where(m_max == float("-inf"), 0.0, m_max)
++        w = tl.exp(m - m_max)                       # segments with -inf give 0
++        l_tot = tl.sum(l * w, 0)
++        d = tl.arange(0, D)
++        o = tl.load(part_o_ptr + (base + segs)[:, None] * D + d[None, :])   # [NSEG, D]
++        o = tl.sum(o * w[:, None], 0) / tl.maximum(l_tot, 1e-30)
++        tl.store(out_ptr + (q_start + i) * stride_ot + h * stride_oh + d, o.to(out_ptr.dtype.element_ty))
++
++
++class SpecDecodeAttention:
++    """Holds the partial buffers; call .run(...) per layer."""
++
++    def __init__(self, max_num_reqs, num_heads, head_dim, device, qmax,
++                 num_segments=NUM_SEGMENTS):
++        # The partial buffers are allocated once, for the longest query block the caller
++        # will ever pass (qmax): a CUDA graph captures their addresses, so growing them
++        # later would leave the captured decode graph pointing at freed memory.
++        self.nseg = num_segments
++        self.qmax = qmax
++        self.max_num_reqs = max_num_reqs
++        self.num_heads = num_heads
++        self.head_dim = head_dim
++        self.device = device
++        n = max_num_reqs * num_heads * qmax * self.nseg
++        self.part_o = torch.empty(n, head_dim, dtype=torch.float32, device=device)
++        self.part_m = torch.empty(n, dtype=torch.float32, device=device)
++        self.part_l = torch.empty(n, dtype=torch.float32, device=device)
++
++    def _plan(self, q_len, G, D):
++        """(BLOCK_M, tokens per tile, tile count, warps). One tile is preferred: every
++        extra tile re-reads this request's KV segment."""
++        override = os.environ.get("VLLM_SPEC_ATTN_BLOCK_M")
++        rows = q_len * G
++        if override:
++            block_m = int(override)
++        elif rows <= 32:
++            block_m = 32
++        elif rows <= 64:
++            block_m = 64
++        else:
++            block_m = BLOCK_M_BIG
++        block_m = max(block_m, G if G > 1 else 1)
++        block_m = 1 << (block_m - 1).bit_length()
++        qt = max(1, block_m // G)
++        return block_m, qt, triton.cdiv(q_len, qt), 8 if block_m >= 128 else 4
++
++    def run(self, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, scale, num_reqs, max_query_len):
++        Hq, D = q.shape[1], q.shape[2]
++        Hkv = key_cache.shape[2]
++        G = Hq // Hkv
++        assert max_query_len <= self.qmax, "too many query tokens per request for this kernel"
++        assert num_reqs <= self.max_num_reqs
++        # shared memory on sm86 is 99 KB: q tile + one K and one V tile + scores must fit
++        block_m, qt, ntile, warps = self._plan(max_query_len, G, D)
++        tile = 64 if (block_m <= 32 or D <= 128) else 32
++        grid = (num_reqs * ntile, Hkv, self.nseg)
++        _spec_attn_partial[grid](
++            q, key_cache, value_cache, block_table, seqused_k, cu_seqlens_q,
++            self.part_o, self.part_m, self.part_l,
++            scale,
++            q.stride(0), q.stride(1),
++            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
++            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
++            block_table.stride(0),
++            G=G, Hq=Hq, QMAX=self.qmax, D=D, BLOCK_SIZE=key_cache.shape[1], BLOCK_M=block_m,
++            TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile,
++            num_warps=warps, num_stages=1,
++        )
++        _spec_attn_combine[(num_reqs, Hq, max_query_len)](
++            self.part_o, self.part_m, self.part_l, out, cu_seqlens_q,
++            out.stride(0), out.stride(1),
++            Hq=Hq, QMAX=self.qmax, D=D, NSEG=self.nseg, num_warps=4,
++        )
++        return out
+
+
+===== FILE: patches/dflash2-backport.patch =====
+DFlash2 speculative decoding on vLLM 0.27.1 (single-user SPEC=dflash2).
+
+Backport of vLLM PR #52816 ("[Spec Decode] DFlash2: local convolution + candidate
+selector", SubSir, Aug 2026) onto 0.27.1, plus the pieces of vLLM main it silently relies
+on and what our stack needs:
+  - PR: DFlash2DraftModel (model_executor/models/qwen3_dflash2.py: grouped dynamic
+    convolutions + candidate selector), the V2-runner DFlash2Speculator
+    (v1/worker/gpu/spec_decode/dflash2/), registry + use_v2_model_runner hooks,
+    is_causal precedence in _dflash_layer_causal (the DFlash2 config is top-level
+    is_causal=false with all-sliding layer_types; without this hunk the drafter runs
+    causal).
+  - main: sample_idx_mapping sentinel -1 (DFlash2's kernels test req_state >= 0;
+    with 0.27.1's zero-init the CUDA-graph capture would scatter every padding row into
+    request slot 0 and poison its proposal distribution); DFlash prepare-inputs kernel
+    hardening (rejected-suffix context rows and null-block entries of a sliding-window
+    block table no longer write draft KV into physical block 0; seq_lens clamp);
+    DFlash reserves K draft slots per request (not K-1); NaN guards before the
+    rejection sampler's argmax.
+  - 0.27.1 caches temperature-APPLIED draft logits (main caches pre-temperature and
+    divides on load), so the selector walk stores scores/temperature — without this the
+    lossless verify would use softmax(scores) while the draft sampled from
+    softmax(scores/T) for 0 < T != 1.
+  - our stack: the draft shares the target's int8-Marlin lm_head, so compute_candidates
+    accepts any quant_method with apply() (2-D input); the context-KV precompute
+    dequantizes k/v rows from a W4A16 (compressed-tensors) qkv_proj so the drafter itself
+    can be requantized (prepare/fetch_dflash2.py / drafter/quant_dflash2.py); flashinfer.top_k
+    falls back to torch.topk if its JIT build fails (VLLM_DFLASH2_TORCH_TOPK=1 forces
+    torch.topk); the V2 sampler passes k_max so patches/sampler-small-topk-fast-softmax's
+    sort-free small-k top-k/top-p path is used under the V2 runner too; the selector
+    walk applies the request's top-k/top-p to its 16-candidate proposal and caches the
+    truncated q (the DFlash2 analogue of the MTP draft truncation; lossless;
+    VLLM_DFLASH2_DRAFT_TOPK_TOPP=0 disables), with the model runner handing the
+    sampling-state buffers to the speculator.
+
+Apply from the installed vllm package directory, after the other patches:
+  patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/dflash2-backport.patch
+
+Written against vLLM 0.27.1 (requires patches/sampler-small-topk-fast-softmax.patch for
+the k_max argument). Reapply after upgrades.
+
+--- a/config/vllm.py
++++ b/config/vllm.py
+@@ -599,6 +599,12 @@
+         if self._dflash_needs_multi_kv_group():
+             return True
+ 
++        # The DFlash2 candidate selector exists only in the V2 speculator. On V1
++        # the same checkpoint drafts through DFlashProposer, which never calls
++        # it, so the draft degrades to DFlash1 silently. Force V2 as for dspark.
++        if self._is_dflash2_draft():
++            return True
++
+         if self.model_config is not None and self.model_config.is_diffusion:
+             return True
+ 
+@@ -622,6 +628,17 @@
+ 
+         return True
+ 
++    def _is_dflash2_draft(self) -> bool:
++        """Whether the DFlash draft is a DFlash2 one, by the architecture the
++        speculator selects on (v1/worker/gpu/spec_decode/__init__.py)."""
++        spec = self.speculative_config
++        if spec is None or spec.method != "dflash":
++            return False
++        draft_config = getattr(spec, "draft_model_config", None)
++        if draft_config is None:
++            return False
++        return "DFlash2DraftModel" in (draft_config.architectures or [])
++
+     def _dflash_needs_multi_kv_group(self) -> bool:
+         """Whether a DFlash draft mixes sliding-window and full attention."""
+         spec = self.speculative_config
+--- a/config/speculative.py
++++ b/config/speculative.py
+@@ -1361,6 +1361,9 @@
+         when drafting.
+         """
+         slots_per_req = 0  # for serial non-draft-model methods, no change needed
++        if self.method == "dflash":
++            # DFlash uses one bonus query followed by K mask queries (vLLM main).
++            return self.num_speculative_tokens
+         if self.parallel_drafting:
+             # For parallel drafting, we need one new slot per 'masked' token
+             slots_per_req = self.num_speculative_tokens - 1
+--- a/model_executor/models/qwen3_dflash.py
++++ b/model_executor/models/qwen3_dflash.py
+@@ -56,10 +56,13 @@
+ 
+ 
+ def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
+-    """``dflash_config.causal`` overrides all layers; else only SWA layers causal."""
++    """Resolve explicit causality before falling back to legacy layer defaults."""
++    is_causal = getattr(config, "is_causal", None)
++    if is_causal is not None:
++        return bool(is_causal)
+     override = (getattr(config, "dflash_config", None) or {}).get("causal")
+     if override is not None:
+-        return override
++        return bool(override)
+     layer_types = getattr(config, "layer_types", None)
+     return bool(layer_types) and layer_types[layer_idx] == _SLIDING_ATTENTION
+ 
+@@ -342,8 +345,31 @@
+         return hidden_states, residual
+ 
+ 
++def _dense_kv_rows(attn: nn.Module) -> torch.Tensor:
++    """Rows [q_size:] of the qkv projection as a dense bf16 matrix. For a compressed-tensors
++    W4A16/W8A16 (pack-quantized, symmetric, group) qkv_proj this is called from load_weights,
++    i.e. before the Marlin repack, so weight_packed/weight_scale are still in the plain
++    checkpoint layout and can be dequantized here."""
++    qkv = attn.qkv_proj
++    w = getattr(qkv, "weight", None)
++    if w is not None and w.dim() == 2:
++        return w[attn.q_size :]
++    packed, scale = qkv.weight_packed, qkv.weight_scale
++    # (weight_shape holds only the last-loaded shard of a fused qkv; use the tensors.)
++    out_f, in_f = int(packed.shape[0]), int(qkv.input_size)
++    bits = 32 * packed.shape[1] // in_f
++    from compressed_tensors.compressors.pack_quantized.base import unpack_from_int32
++    q = unpack_from_int32(packed.data, bits, torch.Size([out_f, in_f]), packed_dim=1)
++    group = in_f // scale.shape[1]
++    dense = (q.to(torch.float32).reshape(out_f, in_f // group, group)
++             * scale.to(torch.float32)[..., None]).reshape(out_f, in_f)
++    return dense.to(scale.dtype if scale.dtype.is_floating_point else torch.bfloat16)[attn.q_size :]
++
++
+ @support_torch_compile
+ class DFlashQwen3Model(nn.Module):
++    decoder_layer_cls = DFlashQwen3DecoderLayer
++
+     hf_to_vllm_mapper = WeightsMapper(
+         orig_to_new_substr={"midlayer.": "layers.0."},
+         orig_to_new_stacked={
+@@ -397,7 +423,7 @@
+ 
+         self.layers = nn.ModuleList(
+             [
+-                DFlashQwen3DecoderLayer(
++                self.decoder_layer_cls(
+                     current_vllm_config,
+                     config=self.config,
+                     layer_idx=layer_idx,
+@@ -445,7 +471,7 @@
+         self._hidden_norm_weight = self.hidden_norm.weight.data
+ 
+         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
+-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
++        kv_weights = [_dense_kv_rows(a) for a in layers_attn]
+         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+         if has_bias:
+             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
+@@ -662,6 +688,8 @@
+ 
+ 
+ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
++    model_cls = DFlashQwen3Model
++
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         nn.Module.__init__(self)
+         self.draft_model_config = vllm_config.speculative_config.draft_model_config
+@@ -671,7 +699,7 @@
+         target_layer_num = vllm_config.model_config.get_num_layers(
+             vllm_config.parallel_config
+         )
+-        self.model = DFlashQwen3Model(
++        self.model = self.model_cls(
+             vllm_config=vllm_config,
+             prefix=maybe_prefix(prefix, "model"),
+             start_layer_id=target_layer_num,
+--- a/model_executor/models/registry.py
++++ b/model_executor/models/registry.py
+@@ -614,6 +614,7 @@
+     "EagleLlama4ForCausalLM": ("llama4_eagle", "EagleLlama4ForCausalLM"),
+     "EagleMiniCPMForCausalLM": ("minicpm_eagle", "EagleMiniCPMForCausalLM"),
+     "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
++    "DFlash2DraftModel": ("qwen3_dflash2", "DFlash2Qwen3ForCausalLM"),
+     "DSparkDraftModel": ("vllm.models.deepseek_v4", "DSparkDeepseekV4ForCausalLM"),
+     "Qwen3DSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
+     "K3DSparkModel": (
+--- a/v1/worker/gpu/model_runner.py
++++ b/v1/worker/gpu/model_runner.py
+@@ -368,6 +368,9 @@
+                     self.speculative_config,
+                     self.device,
+                 )
++            if self.speculator is not None and hasattr(self.speculator, "set_sampling_states"):
++                # DFlash2 truncates its proposal to the request's top-k/top-p.
++                self.speculator.set_sampling_states(self.sampler.sampling_states)
+             self.prompt_logprobs_worker = PromptLogprobsWorker(
+                 self.max_num_reqs,
+                 logprobs_mode=self.model_config.logprobs_mode,
+--- a/v1/worker/gpu/spec_decode/__init__.py
++++ b/v1/worker/gpu/spec_decode/__init__.py
+@@ -9,6 +9,12 @@
+     speculative_config = vllm_config.speculative_config
+     assert speculative_config is not None
+     if speculative_config.method == "dflash":
++        if "DFlash2DraftModel" in speculative_config.draft_model_config.architectures:
++            from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
++                DFlash2Speculator,
++            )
++
++            return DFlash2Speculator(vllm_config, device)
+         from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+             DFlashSpeculator,
+         )
+--- a/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -84,8 +84,9 @@
+         self.sample_pos = torch.zeros(
+             max_num_sampled_tokens, dtype=torch.int64, device=device
+         )
+-        self.sample_idx_mapping = torch.zeros(
+-            max_num_sampled_tokens, dtype=torch.int32, device=device
++        # -1 = inert row (DFlash2's kernels test req_state >= 0); padded to -1 per step anyway
++        self.sample_idx_mapping = torch.full(
++            (max_num_sampled_tokens,), -1, dtype=torch.int32, device=device
+         )
+         # [0, 1, ..., N-1, 0, 1, ..., N-1, ...] -> the per-token column index into
+         # draft_logits[req, step, :].
+@@ -139,7 +140,7 @@
+         # dummy runs from being baked into the captured graph.
+         self.sample_indices.zero_()
+         self.sample_pos.zero_()
+-        self.sample_idx_mapping.zero_()
++        self.sample_idx_mapping.fill_(-1)
+         assert self.query_cudagraph_manager is not None
+         self.query_cudagraph_manager.capture(
+             self._generate_draft,
+@@ -521,6 +522,7 @@
+ 
+     num_rejected = tl.load(num_rejected_ptr + req_idx)
+     valid_ctx_end = ctx_end - num_rejected
++    num_valid_ctx = valid_ctx_end - ctx_start
+ 
+     num_sampled = tl.load(num_sampled_ptr + req_idx)
+     if num_sampled > 0:
+@@ -534,20 +536,29 @@
+ 
+     j = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+     is_ctx = j < num_ctx
+-    is_query = (j >= num_ctx) & (j < num_ctx + num_query_per_req)
+-    query_off = j - num_ctx
++    is_valid_ctx = j < num_valid_ctx
++    is_query = (j >= num_valid_ctx) & (j < num_valid_ctx + num_query_per_req)
++    query_off = j - num_valid_ctx
+ 
+     # --- Context positions / slots ---
+     ctx_pos_idx = ctx_start + tl.where(is_ctx, j, 0)
+-    ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_ctx, other=0)
++    ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_valid_ctx, other=0)
+     ctx_block_num = ctx_pos // block_size
+     ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
+     ctx_block_id = tl.load(
+         block_table_ptr + req_idx * block_table_stride + ctx_block_num,
+-        mask=is_ctx,
++        mask=is_valid_ctx,
+         other=0,
+     ).to(tl.int64)
+-    ctx_slot = ctx_block_id * block_size + (ctx_pos % block_size)
++    # Block 0 is the null block. Old sliding-window context positions can map
++    # to it after eviction; rejected suffix rows are invalid context as well.
++    # Neither kind of row may write draft KV into physical block 0. (vLLM main)
++    ctx_resident = is_valid_ctx & (ctx_block_id != 0)
++    ctx_slot = tl.where(
++        ctx_resident,
++        ctx_block_id * block_size + (ctx_pos % block_size),
++        PAD_SLOT_ID,
++    )
+     tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
+     tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
+ 
+@@ -564,7 +575,14 @@
+         mask=is_query,
+         other=0,
+     ).to(tl.int64)
+-    q_slot = q_block_id * block_size + (query_pos % block_size)
++    # A null block is never a writable cache slot (sliding-window block tables
++    # contain evicted/global padding entries). (vLLM main)
++    q_resident = is_query & (q_block_id != 0)
++    q_slot = tl.where(
++        q_resident,
++        q_block_id * block_size + (query_pos % block_size),
++        PAD_SLOT_ID,
++    )
+ 
+     tl.store(out_input_ids_ptr + query_idx, input_id, mask=is_query)
+     clamped_query_pos = tl.minimum(query_pos, max_model_len - 1)
+@@ -589,7 +607,10 @@
+         # seq_lens is the absolute sequence length the draft attention
+         # reads up to (context + query), not just the count of accepted
+         # tokens this step.
+-        tl.store(out_seq_lens_ptr + req_idx, last_valid_pos + 1 + num_query_per_req)
++        tl.store(
++            out_seq_lens_ptr + req_idx,
++            tl.minimum(last_valid_pos + 1 + num_query_per_req, max_model_len),
++        )
+         # Copy sampling state.
+         tl.store(
+             out_temperature_ptr + req_state_idx,
+--- a/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -108,6 +108,7 @@
+         mask=blocks_mask,
+         other=float("-inf"),
+     )
++    local_max = tl.where(local_max != local_max, float("-inf"), local_max)
+     max_block_idx = tl.argmax(local_max, axis=0)
+     return tl.load(
+         target_local_argmax_ptr + logit_idx * target_local_argmax_stride + max_block_idx
+@@ -849,6 +850,9 @@
+         mask=mask,
+         other=float("-inf"),
+     )
++    resampled_local_max = tl.where(
++        resampled_local_max != resampled_local_max, float("-inf"), resampled_local_max
++    )
+     resampled_max_block_idx = tl.argmax(resampled_local_max, axis=0)
+     resampled = tl.load(
+         resampled_local_argmax_ptr
+--- a/v1/worker/gpu/sample/states.py
++++ b/v1/worker/gpu/sample/states.py
+@@ -109,7 +109,14 @@
+         top_k, top_p = self.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np)
+         if top_k is None and top_p is None:
+             return logits
+-        return apply_top_k_top_p(logits, top_k, top_p)
++        return apply_top_k_top_p(logits, top_k, top_p, self.top_k_max(idx_mapping_np))
++
++    def top_k_max(self, idx_mapping_np: np.ndarray) -> int | None:
++        # Largest top_k in the batch (host-side), for the sort-free small-k path.
++        ks = self.top_k.np[idx_mapping_np]
++        if ks.size == 0 or np.any(ks == self.vocab_size):
++            return None
++        return int(ks.max())
+ 
+     def any_greedy(self, idx_mapping_np: np.ndarray) -> bool:
+         return bool(np.any(self.temperature.np[idx_mapping_np] == 0.0))
+--- a/v1/worker/gpu/sample/sampler.py
++++ b/v1/worker/gpu/sample/sampler.py
+@@ -251,7 +251,10 @@
+         if use_flashinfer:
+             sampled = flashinfer_sample(processed_logits, top_k, top_p).to(torch.int64)
+         else:
+-            processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
++            processed_logits = apply_top_k_top_p(
++                processed_logits, top_k, top_p,
++                self.sampling_states.top_k_max(idx_mapping_np),
++            )
+             sampled = gumbel_sample(
+                 processed_logits,
+                 expanded_idx_mapping,
+--- /dev/null
++++ b/model_executor/models/qwen3_dflash2.py
+@@ -0,0 +1,366 @@
++import os
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from collections.abc import Callable
++from functools import cache
++
++import torch
++import torch.nn.functional as F
++from torch import nn
++
++from vllm.compilation.decorators import support_torch_compile
++from vllm.config import CacheConfig, VllmConfig
++from vllm.distributed import (
++    get_tensor_model_parallel_world_size,
++    tensor_model_parallel_all_gather,
++)
++from vllm.logger import init_logger
++from vllm.model_executor.layers.linear import ReplicatedLinear
++from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    UnquantizedEmbeddingMethod,
++)
++from vllm.platforms import current_platform
++from vllm.utils.flashinfer import has_flashinfer
++
++from .qwen3_dflash import (
++    DFlashQwen3DecoderLayer,
++    DFlashQwen3ForCausalLM,
++    DFlashQwen3Model,
++)
++from .utils import maybe_prefix
++
++logger = init_logger(__name__)
++
++
++@cache
++def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | None:
++    """FlashInfer's radix top-k, or None for torch.topk.
++
++    This top-k spans the vocabulary and is the selector's largest single cost,
++    where the radix kernel is about twice torch.topk.
++    """
++    if not current_platform.is_cuda():
++        return None
++    if not has_flashinfer():
++        logger.info_once(
++            "flashinfer is unavailable; the DFlash2 selector uses torch.topk, "
++            "at roughly half the speed."
++        )
++        return None
++    if os.environ.get("VLLM_DFLASH2_TORCH_TOPK", "0") == "1":
++        return None
++    try:
++        from flashinfer import top_k
++    except Exception as e:  # noqa: BLE001
++        logger.info_once("flashinfer.top_k import failed (%s); using torch.topk", e)
++        return None
++    return top_k
++
++
++_TOPK_BROKEN = False
++
++
++def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
++    global _TOPK_BROKEN
++    impl = None if _TOPK_BROKEN else _flashinfer_topk()
++    if impl is None or not scores.is_cuda:
++        return torch.topk(scores, k, dim=-1)
++    try:
++        return impl(scores, k, sorted=True, deterministic=True)
++    except Exception as e:  # noqa: BLE001  (JIT build failure, unsupported arch, ...)
++        _TOPK_BROKEN = True
++        logger.warning_once("flashinfer.top_k failed (%s); falling back to torch.topk", e)
++        return torch.topk(scores, k, dim=-1)
++
++
++def _grouped_conv(
++    hidden_states: torch.Tensor,
++    delta: torch.Tensor,
++    base: torch.Tensor,
++    block_size: int,
++    num_groups: int,
++    group_size: int,
++    taps: int,
++) -> torch.Tensor:
++    blocks = hidden_states.unflatten(-1, (num_groups, group_size))
++    coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
++    output = coefficients[:, 0] * blocks
++    position = torch.arange(hidden_states.shape[0], device=hidden_states.device)
++    if block_size & (block_size - 1) == 0:
++        position = position & (block_size - 1)
++    else:
++        position = position % block_size
++    for tap in range(1, taps):
++        shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
++        output += coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
++    return output.flatten(-2)
++
++
++class DFlashGroupedConv(nn.Module):
++    def __init__(
++        self,
++        hidden_size: int,
++        taps: int,
++        group_size: int,
++        block_size: int,
++        params_dtype: torch.dtype,
++        prefix: str,
++    ) -> None:
++        super().__init__()
++        if hidden_size % group_size:
++            raise ValueError(
++                f"conv_group_size={group_size} must divide hidden_size={hidden_size}."
++            )
++        self.block_size = block_size
++        self.taps = taps
++        self.group_size = group_size
++        self.num_groups = hidden_size // group_size
++        self.base_kernel = nn.Parameter(
++            torch.empty(2, taps, hidden_size, dtype=params_dtype),
++            requires_grad=False,
++        )
++        self.kernel_projection = ReplicatedLinear(
++            hidden_size,
++            2 * taps * self.num_groups,
++            bias=False,
++            params_dtype=params_dtype,
++            quant_config=None,
++            prefix=maybe_prefix(prefix, "kernel_projection"),
++            return_bias=False,
++        )
++
++    def _convolve(
++        self, hidden_states: torch.Tensor, delta: torch.Tensor, side: int
++    ) -> torch.Tensor:
++        return _grouped_conv(
++            hidden_states,
++            delta,
++            self.base_kernel[side],
++            self.block_size,
++            self.num_groups,
++            self.group_size,
++            self.taps,
++        )
++
++    def prepare(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        coefficients = self.kernel_projection(hidden_states).reshape(
++            hidden_states.shape[0], 2, self.taps, s

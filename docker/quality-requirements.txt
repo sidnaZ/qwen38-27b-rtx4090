@@ -1,0 +1,3 @@
+# Required by bench/quality_battery.py to read the frozen parquet datasets.
+# Kept separate so serving-stack dependency changes do not silently drift.
+pyarrow==21.0.0

@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "release": {
+    "name": "Qwen3.8-27B RTX 4090",
+    "image": "qwen38-27b-rtx4090:latest",
+    "validated_image_id": "sha256:059d52965802e0506a2b092a71255f98fe7ab439414bd85aac0b4e51de546df3",
+    "source_state": "validated from the source tree published with this release"
+  },
+  "upstream": {
+    "repository": "https://github.com/syv-ai/qwen38-27b-rtx3090",
+    "commit": "bb739e4e5d6bc4fbdcea9e583bfcf190e245b032"
+  },
+  "container": {
+    "base": "nvidia/cuda:13.0.1-base-ubuntu24.04@sha256:f8ef28f579ea42a44b415d2c5d46f788e6a9b395c6c83f2929416e1fc192c143",
+    "python": "3.12.3",
+    "vllm": "0.27.1",
+    "torch": "2.13.0+cu130",
+    "triton": "3.7.1",
+    "transformers": "5.15.0",
+    "tokenizers": "0.22.2",
+    "compressed_tensors": "0.17.0",
+    "flashinfer": "0.6.16.post3"
+  },
+  "models": {
+    "base": {
+      "repository": "dbirks/Qwen3.8-27B-W4A16-AutoRound",
+      "revision": "1f05c441c4e64ae0549de44fa9ea5a6d43610314",
+      "config_sha256": "eddb28f7bce03eb208d8c97a4ad182188ef7afed45a4c4ac85043746f3b2d485",
+      "index_sha256": "0821f46ee37fe037e967cce067b33baf3ba1b71fa70bc0d6a94ef5684f1131a1"
+    },
+    "fast_variant": {
+      "repository": "syvai/qwen3.8-27b-3090-fast-variant",
+      "revision": "124c14e7e8c7d2f5402933b9af368e772a9fcf0c",
+      "config_sha256": "5a3e7312cfc2caeab24419e6147c5cf55bc37054eab7d51e38dbf2f563b7fd62"
+    },
+    "dflash2": {
+      "repository": "syvai/Qwen3.8-27B-DFlash2-W4A16",
+      "revision": "4d30ec736ffc6b8688dc2ae2b502d9b48bdec279",
+      "config_sha256": "61d6276f878e1c50e09cb8c006643e607fa8cf03b9dacbe5c95d956a10bac556"
+    }
+  },
+  "quality_datasets": {
+    "Salesforce/wikitext": "b08601e04326c79dfdd32d625aee71d232d685c3",
+    "openai/gsm8k": "740312add88f781978c0658806c59bc2815b9866",
+    "HuggingFaceFW/fineweb-2": "af9c13333eb981300149d5ca60a8e9d659b276b9"
+  },
+  "host": {
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "compute_capability": "8.9",
+    "vram_mib": 24564,
+    "driver": "595.84",
+    "operating_system": "native Linux"
+  }
+}

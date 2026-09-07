@@ -1,0 +1,75 @@
+name: qwen38-27b-rtx4090
+
+x-runtime: &runtime
+  image: ${IMAGE:-qwen38-27b-rtx4090:latest}
+  build: .
+  pull_policy: never
+  ipc: host
+  environment:
+    HOME: /cache
+  volumes:
+    - ${MODELS_DIR:-./.artifacts/models}:/app/models
+    - ${CACHE_DIR:-./.artifacts/cache}:/cache
+    - ${QUALITY_DATA_DIR:-./.artifacts/quality-data}:/app/bench/quality-data
+
+x-server: &server
+  <<: *runtime
+  ports:
+    - "127.0.0.1:${PORT:-18020}:${PORT:-18020}"
+  depends_on:
+    prepare:
+      condition: service_completed_successfully
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+  restart: unless-stopped
+  stop_grace_period: 30s
+  healthcheck:
+    test: ["CMD", "curl", "-sf", "http://127.0.0.1:${PORT:-18020}/health"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 900s
+
+services:
+  prepare:
+    <<: *runtime
+    command: prepare
+    environment:
+      HOME: /cache
+      HF_TOKEN: ${HF_TOKEN:-}
+
+  single-user:
+    <<: *server
+    profiles: [single-user]
+    command: single
+    environment:
+      HOME: /cache
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+      SPEC: dflash2
+      CTX: fast
+      PREFIX_CACHE: "1"
+      DFLASH_TOKENS: "7"
+      SPEC_ATTN: "1"
+      VLLM_DFLASH2_CHAIN: "1"
+
+  batch:
+    <<: *server
+    profiles: [batch]
+    command: batch
+    environment:
+      HOME: /cache
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+      INT8_ACT: ${INT8_ACT:-}
+      INT8_LAYERS: ${INT8_LAYERS:-}
+      KV: ${KV:-fp8}
+      MAX_SEQS: ${MAX_SEQS:-32}
+      MAX_LEN: ${MAX_LEN:-150000}
+      GPU_UTIL: ${GPU_UTIL:-0.93}
+      PREFIX_CACHE: ${PREFIX_CACHE:-0}
+      TOOLS: ${TOOLS:-1}
+      EXTRA_ARGS: ${EXTRA_ARGS:---kv-cache-memory=5368709120}

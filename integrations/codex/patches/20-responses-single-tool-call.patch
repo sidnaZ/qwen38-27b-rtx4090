@@ -1,0 +1,104 @@
+Responses streaming: enforce parallel_tool_calls=false.
+
+The Responses protocol carries parallel_tool_calls, but unlike Chat Completions
+the simple Responses streamer did not enforce it. Models could therefore emit
+a second tool call even when the client explicitly disabled parallel calls. A
+malformed second call could reach the client before vLLM failed while opening a
+later nameless fragment, permanently poisoning resumable Codex history.
+
+Track the first named tool call when parallel calls are disabled. Keep only
+continuations for that call while it is open and discard later or orphaned tool
+fragments. Reasoning and content in the same delta are preserved.
+
+This patch applies after 10-responses-tool-tail-order.patch.
+
+--- a/entrypoints/openai/responses/streaming_events.py
++++ b/entrypoints/openai/responses/streaming_events.py
+@@ -1199,10 +1199,68 @@ class SimpleStreamingEventProcessor:
+     def __init__(
+         self,
+         state: SimpleStreamingState | None = None,
+         tools: list[Tool] | None = None,
++        allow_parallel_tool_calls: bool = True,
+     ) -> None:
+         self.state = state or SimpleStreamingState()
+         self.tool_call_name_map = build_responses_tool_call_name_map(tools)
++        self.allow_parallel_tool_calls = allow_parallel_tool_calls
++        self._accepted_tool_call_index: int | None = None
++        self._accepted_tool_call_name: str | None = None
++        self._has_accepted_tool_call = False
++
++    def filter_parallel_tool_calls(
++        self, delta_message: DeltaMessage
++    ) -> DeltaMessage:
++        """Keep only the first tool call when parallel calls are disabled.
++
++        A nameless tool delta is a continuation only while its matching call
++        is open. Treating an orphan or a different index as a new call would
++        either construct a tool item with ``name=None`` or expose malformed
++        arguments to the client before the stream fails.
++        """
++        tool_calls = delta_message.tool_calls
++        if self.allow_parallel_tool_calls or not tool_calls:
++            return delta_message
++
++        accepting_first = not self._has_accepted_tool_call
++        if accepting_first:
++            first = next(
++                (
++                    tc
++                    for tc in tool_calls
++                    if tc.function is not None and tc.function.name is not None
++                ),
++                None,
++            )
++            if first is None:
++                delta_message.tool_calls = []
++                return delta_message
++            self._has_accepted_tool_call = True
++            self._accepted_tool_call_index = first.index
++            self._accepted_tool_call_name = first.function.name
++
++        accepted_index = self._accepted_tool_call_index
++        accepted_name = self._accepted_tool_call_name
++        if accepting_first:
++            delta_message.tool_calls = [
++                tc
++                for tc in tool_calls
++                if tc.index == accepted_index
++                and tc.function is not None
++                and tc.function.name == accepted_name
++            ]
++        elif self.state.current_state == _StateType.TOOL_CALL:
++            delta_message.tool_calls = [
++                tc
++                for tc in tool_calls
++                if tc.index == accepted_index
++                and tc.function is not None
++                and tc.function.name in (None, accepted_name)
++            ]
++        else:
++            delta_message.tool_calls = []
++        return delta_message
+ 
+     def resolve_target_state(
+         self, delta_message: DeltaMessage
+--- a/entrypoints/openai/responses/serving.py
++++ b/entrypoints/openai/responses/serving.py
+@@ -1355,4 +1355,7 @@ class OpenAIServingResponses(OpenAIServing):
+     ) -> AsyncGenerator[StreamingResponsesResponse, None]:
+-        processor = SimpleStreamingEventProcessor(tools=request.tools)
++        processor = SimpleStreamingEventProcessor(
++            tools=request.tools,
++            allow_parallel_tool_calls=request.parallel_tool_calls is not False,
++        )
+ 
+         hide_stream_metadata = not request.include_reasoning and self.parser is not None
+@@ -1395,6 +1398,7 @@ class OpenAIServingResponses(OpenAIServing):
+             if not delta_message:
+                 continue
+ 
++            delta_message = processor.filter_parallel_tool_calls(delta_message)
+             for dm in split_delta(
+                 delta_message, processor.state.current_state
+             ):

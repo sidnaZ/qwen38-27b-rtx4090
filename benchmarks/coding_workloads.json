@@ -1,0 +1,56 @@
+[
+  {
+    "id": "short_refactor",
+    "category": "short coding context",
+    "context_file": "corpus/short_refactor.txt",
+    "context_chars": 6000,
+    "context_sha256": "1d276beb33d019b148f676a6efc43827ca8c2e3be1e4ccaa3c91a113dbd1b6f5",
+    "instruction": "Review the code, identify one correctness risk and one performance issue, then provide a focused unified diff and a concise rationale.",
+    "max_tokens": 384
+  },
+  {
+    "id": "medium_feature",
+    "category": "medium coding conversation",
+    "context_file": "corpus/medium_feature.txt",
+    "context_chars": 32000,
+    "context_sha256": "9ea815dc496b0ae2726dfb5e6c0100a5348e8a6bbab4d152d2876c16a7f259b4",
+    "instruction": "Design a robust dry-run mode for the launch path. Explain the interfaces affected, provide the important code changes, and list tests for shell quoting and environment precedence.",
+    "max_tokens": 512
+  },
+  {
+    "id": "long_review",
+    "category": "long coding context",
+    "context_file": "corpus/long_review.txt",
+    "context_chars": 120003,
+    "context_sha256": "0a65447cc19325558732f707bbf599ee0956d87d2e31cc3711630fbb376a88e8",
+    "instruction": "Perform a production-readiness review. Prioritize the three highest-risk correctness or resource-management issues, cite the relevant symbols, and propose a validation plan. Do not rewrite the whole system.",
+    "max_tokens": 384
+  },
+  {
+    "id": "prefill_dominant",
+    "category": "prefill dominated",
+    "context_file": "corpus/prefill_dominant.txt",
+    "context_chars": 160003,
+    "context_sha256": "f22b7b5df0f73a6250605d4dfc7ffd3eb66552e256ea21d2af40ae941726b2b4",
+    "instruction": "Name the two main attention strategies represented here and state one sentence about when each is used.",
+    "max_tokens": 48
+  },
+  {
+    "id": "context_copy",
+    "category": "speculation-friendly context reuse",
+    "context_file": "corpus/context_copy.txt",
+    "context_chars": 90000,
+    "context_sha256": "2ffa36547abb5a7cf723db2b6ee1cffc4881ad77b5aa8122c47e2805be9f35cd",
+    "instruction": "Reproduce verbatim the complete `texts_from` function from `prepare/build_draft_vocab.py`, including its signature and body. Output only that code.",
+    "max_tokens": 640
+  },
+  {
+    "id": "sustained_decode",
+    "category": "decode dominated",
+    "context_file": null,
+    "context_chars": 0,
+    "context_sha256": null,
+    "instruction": "Write a complete Python 3.12 module implementing a bounded, thread-safe TTL cache with per-key expiry, LRU eviction, statistics, type hints, docstrings, and pytest tests. Explain the concurrency invariants after the code.",
+    "max_tokens": 1024
+  }
+]

@@ -1,0 +1,28 @@
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+api_key.txt
+profiles/*.local.env
+
+# Models, caches, datasets, and generated benchmark output
+.artifacts/
+models/
+bench/quality-data/
+bench/results/
+
+# Local environments and generated language/tooling state
+venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.codebase-memory/
+
+# Runtime logs and native build output
+*.log
+qwen.log
+build/
+*.so
